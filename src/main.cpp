@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -10,13 +11,61 @@
 
 namespace fs = std::filesystem;
 
-std::vector<std::string> split_args(const std::string& input) {
+std::vector<std::string> parse_args(const std::string& input) {
   std::vector<std::string> args;
-  std::istringstream iss(input);
-  std::string token;
-  while (iss >> token) {
-    args.push_back(token);
+  std::string current;
+  bool in_single_quotes = false;
+  bool in_double_quotes = false;
+
+  for (size_t i = 0; i < input.size(); ++i) {
+    const char c = input[i];
+
+    if (in_single_quotes) {
+      if (c == '\'') {
+        in_single_quotes = false;
+      } else {
+        current += c;
+      }
+      continue;
+    }
+
+    if (in_double_quotes) {
+      if (c == '"') {
+        in_double_quotes = false;
+      } else if (c == '\\' && i + 1 < input.size()) {
+        const char next = input[++i];
+        if (next == '\\' || next == '$' || next == '`' || next == '\n' || next == '"') {
+          current += next;
+        } else {
+          current += '\\';
+          current += next;
+        }
+      } else {
+        current += c;
+      }
+      continue;
+    }
+
+    if (c == '\'') {
+      in_single_quotes = true;
+    } else if (c == '"') {
+      in_double_quotes = true;
+    } else if (c == '\\' && i + 1 < input.size()) {
+      current += input[++i];
+    } else if (std::isspace(static_cast<unsigned char>(c))) {
+      if (!current.empty()) {
+        args.push_back(current);
+        current.clear();
+      }
+    } else {
+      current += c;
+    }
   }
+
+  if (!current.empty()) {
+    args.push_back(current);
+  }
+
   return args;
 }
 
@@ -135,7 +184,7 @@ int main() {
       break;
     }
 
-    const std::vector<std::string> args = split_args(input);
+    const std::vector<std::string> args = parse_args(input);
     if (args.empty()) {
       continue;
     }
