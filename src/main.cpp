@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -275,6 +276,66 @@ std::vector<std::string> parse_args(const std::string& input) {
   return args;
 }
 
+static void trim_stage(std::string& stage) {
+  while (!stage.empty() && std::isspace(static_cast<unsigned char>(stage.front()))) {
+    stage.erase(stage.begin());
+  }
+  while (!stage.empty() && std::isspace(static_cast<unsigned char>(stage.back()))) {
+    stage.pop_back();
+  }
+}
+
+std::vector<std::string> split_pipeline(const std::string& input) {
+  std::vector<std::string> stages;
+  std::string current;
+  bool in_single_quotes = false;
+  bool in_double_quotes = false;
+
+  for (size_t i = 0; i < input.size(); ++i) {
+    const char c = input[i];
+
+    if (in_single_quotes) {
+      if (c == '\'') {
+        in_single_quotes = false;
+      }
+      current += c;
+      continue;
+    }
+
+    if (in_double_quotes) {
+      if (c == '"') {
+        in_double_quotes = false;
+      } else if (c == '\\' && i + 1 < input.size()) {
+        current += input[++i];
+      } else {
+        current += c;
+      }
+      continue;
+    }
+
+    if (c == '\'') {
+      in_single_quotes = true;
+      current += c;
+    } else if (c == '"') {
+      in_double_quotes = true;
+      current += c;
+    } else if (c == '|') {
+      trim_stage(current);
+      stages.push_back(current);
+      current.clear();
+    } else {
+      current += c;
+    }
+  }
+
+  trim_stage(current);
+  if (!current.empty() || !stages.empty()) {
+    stages.push_back(current);
+  }
+
+  return stages;
+}
+
 bool is_builtin(const std::string& cmd) {
   return cmd == "echo" || cmd == "exit" || cmd == "type" || cmd == "pwd" || cmd == "cd" ||
          cmd == "jobs";
@@ -418,6 +479,18 @@ void run_pwd() {
   }
 }
 
+[[noreturn]] void run_builtin_in_child(const std::vector<std::string>& args) {
+  const std::string& cmd = args[0];
+  if (cmd == "echo") {
+    run_echo(args);
+  } else if (cmd == "type") {
+    run_type(args);
+  } else if (cmd == "pwd") {
+    run_pwd();
+  }
+  std::exit(0);
+}
+
 void run_cd(const std::vector<std::string>& args) {
   if (args.size() < 2) {
     return;
@@ -469,6 +542,111 @@ void run_jobs() {
 
   for (auto it = done_indices.rbegin(); it != done_indices.rend(); ++it) {
     bg_jobs().erase(bg_jobs().begin() + static_cast<std::ptrdiff_t>(*it));
+  }
+}
+
+struct PipelineStage {
+  std::vector<std::string> args;
+  RedirectInfo redirect;
+};
+
+void close_all_pipes(std::vector<std::array<int, 2>>& pipes) {
+  for (auto& pipe_fds : pipes) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+  }
+}
+
+void run_pipeline(const std::vector<std::string>& stage_inputs, bool background,
+                  const std::string& original_command) {
+  std::vector<PipelineStage> stages;
+  for (const std::string& stage_input : stage_inputs) {
+    std::vector<std::string> args = parse_args(stage_input);
+    RedirectInfo redirect = extract_redirects(args);
+    if (args.empty()) {
+      return;
+    }
+    stages.push_back({args, redirect});
+  }
+
+  const int num_commands = static_cast<int>(stages.size());
+  std::vector<std::array<int, 2>> pipes(static_cast<size_t>(num_commands - 1));
+  for (int i = 0; i < num_commands - 1; ++i) {
+    if (pipe(pipes[static_cast<size_t>(i)].data()) == -1) {
+      return;
+    }
+  }
+
+  std::vector<pid_t> pids;
+  for (int i = 0; i < num_commands; ++i) {
+    const PipelineStage& stage = stages[static_cast<size_t>(i)];
+    const std::string& program = stage.args[0];
+    const bool builtin = is_builtin(program);
+    std::string path;
+
+    if (!builtin) {
+      path = find_in_path(program);
+      if (path.empty()) {
+        std::cout << program << ": command not found\n";
+        close_all_pipes(pipes);
+        for (pid_t pid : pids) {
+          waitpid(pid, nullptr, 0);
+        }
+        return;
+      }
+    }
+
+    const pid_t pid = fork();
+    if (pid == 0) {
+      if (i > 0) {
+        dup2(pipes[static_cast<size_t>(i - 1)][0], STDIN_FILENO);
+      }
+      if (i < num_commands - 1) {
+        dup2(pipes[static_cast<size_t>(i)][1], STDOUT_FILENO);
+      } else {
+        apply_redirects(stage.redirect);
+      }
+      if (i < num_commands - 1 && !stage.redirect.stderr_file.empty()) {
+        RedirectInfo stderr_only;
+        stderr_only.stderr_file = stage.redirect.stderr_file;
+        stderr_only.stderr_append = stage.redirect.stderr_append;
+        apply_redirects(stderr_only);
+      }
+      close_all_pipes(pipes);
+
+      if (builtin) {
+        run_builtin_in_child(stage.args);
+      }
+
+      std::vector<std::string> arg_storage = stage.args;
+      std::vector<char*> argv;
+      argv.reserve(arg_storage.size() + 1);
+      for (auto& arg : arg_storage) {
+        argv.push_back(arg.data());
+      }
+      argv.push_back(nullptr);
+
+      execv(path.c_str(), argv.data());
+      std::exit(1);
+    }
+
+    if (pid > 0) {
+      pids.push_back(pid);
+    }
+  }
+
+  close_all_pipes(pipes);
+
+  if (background && !pids.empty()) {
+    const int job_number = next_job_number();
+    bg_jobs().push_back({job_number, pids.back(), original_command});
+    std::cout << '[' << job_number << "] " << pids.back() << '\n';
+    return;
+  }
+
+  for (pid_t pid : pids) {
+    int status = 0;
+    waitpid(pid, &status, 0);
   }
 }
 
@@ -538,11 +716,20 @@ int main() {
     }
 
     bool background = false;
-    if (!input.empty() && input.back() == '&') {
+    std::string command_input = input;
+    if (!command_input.empty() && command_input.back() == '&') {
       background = true;
+      command_input.pop_back();
+      trim_stage(command_input);
     }
 
-    std::vector<std::string> args = parse_args(input);
+    const std::vector<std::string> pipeline_stages = split_pipeline(command_input);
+    if (pipeline_stages.size() > 1) {
+      run_pipeline(pipeline_stages, background, input);
+      continue;
+    }
+
+    std::vector<std::string> args = parse_args(command_input);
     if (args.empty()) {
       continue;
     }
