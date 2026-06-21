@@ -33,8 +33,9 @@ std::string find_in_path(const std::string& command) {
   std::stringstream ss(path_env);
   std::string dir;
   while (std::getline(ss, dir, ':')) {
-    fs::path full_path = fs::path(dir) / command;
-    if (fs::exists(full_path) && fs::is_regular_file(full_path)) {
+    const fs::path full_path = fs::path(dir) / command;
+    if (fs::exists(full_path) && fs::is_regular_file(full_path) &&
+        access(full_path.c_str(), X_OK) == 0) {
       return full_path.string();
     }
   }
