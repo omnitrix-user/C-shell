@@ -460,7 +460,11 @@ void run_jobs() {
         std::find(done_indices.begin(), done_indices.end(), i) != done_indices.end();
     std::string status = is_done ? "Done" : "Running";
     status.resize(24, ' ');
-    std::cout << '[' << job.job_number << ']' << marker << ' ' << status << job.command << '\n';
+    std::string cmd = job.command;
+    if (is_done && cmd.size() >= 2 && cmd.substr(cmd.size() - 2) == " &") {
+      cmd = cmd.substr(0, cmd.size() - 2);
+    }
+    std::cout << '[' << job.job_number << ']' << marker << ' ' << status << cmd << '\n';
   }
 
   for (auto it = done_indices.rbegin(); it != done_indices.rend(); ++it) {
