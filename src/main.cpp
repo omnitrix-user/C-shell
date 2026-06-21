@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
+#include <csignal>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
@@ -14,6 +16,99 @@
 #include <unistd.h>
 
 namespace fs = std::filesystem;
+
+struct BackgroundJob {
+  int job_number;
+  pid_t pid;
+  std::string command;
+  bool done = false;
+};
+
+std::vector<BackgroundJob>& bg_jobs() {
+  static std::vector<BackgroundJob> jobs;
+  return jobs;
+}
+
+int next_job_number() {
+  for (int num = 1;; ++num) {
+    bool used = false;
+    for (const BackgroundJob& job : bg_jobs()) {
+      if (job.job_number == num) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) {
+      return num;
+    }
+  }
+}
+
+void sigchld_handler(int /*sig*/) {
+  const int saved_errno = errno;
+  int status = 0;
+  pid_t pid = 0;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    for (BackgroundJob& job : bg_jobs()) {
+      if (job.pid == pid && (WIFEXITED(status) || WIFSIGNALED(status))) {
+        job.done = true;
+        break;
+      }
+    }
+  }
+  errno = saved_errno;
+}
+
+void poll_zombies() {
+  int status = 0;
+  pid_t pid = 0;
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    for (BackgroundJob& job : bg_jobs()) {
+      if (job.pid == pid && (WIFEXITED(status) || WIFSIGNALED(status))) {
+        job.done = true;
+        break;
+      }
+    }
+  }
+}
+
+void reap_jobs() {
+  poll_zombies();
+
+  std::vector<size_t> done_indices;
+  for (size_t i = 0; i < bg_jobs().size(); ++i) {
+    if (bg_jobs()[i].done) {
+      done_indices.push_back(i);
+    }
+  }
+
+  const size_t job_count = bg_jobs().size();
+  for (size_t i = 0; i < job_count; ++i) {
+    if (std::find(done_indices.begin(), done_indices.end(), i) == done_indices.end()) {
+      continue;
+    }
+
+    const BackgroundJob& job = bg_jobs()[i];
+    char marker = ' ';
+    if (i == job_count - 1) {
+      marker = '+';
+    } else if (i == job_count - 2) {
+      marker = '-';
+    }
+
+    std::string status = "Done";
+    status.resize(24, ' ');
+    std::string cmd = job.command;
+    if (cmd.size() >= 2 && cmd.substr(cmd.size() - 2) == " &") {
+      cmd = cmd.substr(0, cmd.size() - 2);
+    }
+    std::cout << '[' << job.job_number << ']' << marker << ' ' << status << cmd << '\n';
+  }
+
+  for (auto it = done_indices.rbegin(); it != done_indices.rend(); ++it) {
+    bg_jobs().erase(bg_jobs().begin() + static_cast<std::ptrdiff_t>(*it));
+  }
+}
 
 struct RedirectInfo {
   std::string stdout_file;
@@ -181,11 +276,12 @@ std::vector<std::string> parse_args(const std::string& input) {
 }
 
 bool is_builtin(const std::string& cmd) {
-  return cmd == "echo" || cmd == "exit" || cmd == "type" || cmd == "pwd" || cmd == "cd";
+  return cmd == "echo" || cmd == "exit" || cmd == "type" || cmd == "pwd" || cmd == "cd" ||
+         cmd == "jobs";
 }
 
 const std::vector<std::string>& builtin_commands() {
-  static const std::vector<std::string> commands = {"cd", "echo", "exit", "pwd", "type"};
+  static const std::vector<std::string> commands = {"cd", "echo", "exit", "jobs", "pwd", "type"};
   return commands;
 }
 
@@ -340,7 +436,40 @@ void run_cd(const std::vector<std::string>& args) {
   }
 }
 
-void run_external(std::vector<std::string> args, const RedirectInfo& redirect) {
+void run_jobs() {
+  poll_zombies();
+
+  std::vector<size_t> done_indices;
+  for (size_t i = 0; i < bg_jobs().size(); ++i) {
+    if (bg_jobs()[i].done) {
+      done_indices.push_back(i);
+    }
+  }
+
+  const size_t job_count = bg_jobs().size();
+  for (size_t i = 0; i < job_count; ++i) {
+    const BackgroundJob& job = bg_jobs()[i];
+    char marker = ' ';
+    if (i == job_count - 1) {
+      marker = '+';
+    } else if (i == job_count - 2) {
+      marker = '-';
+    }
+
+    const bool is_done =
+        std::find(done_indices.begin(), done_indices.end(), i) != done_indices.end();
+    std::string status = is_done ? "Done" : "Running";
+    status.resize(24, ' ');
+    std::cout << '[' << job.job_number << ']' << marker << ' ' << status << job.command << '\n';
+  }
+
+  for (auto it = done_indices.rbegin(); it != done_indices.rend(); ++it) {
+    bg_jobs().erase(bg_jobs().begin() + static_cast<std::ptrdiff_t>(*it));
+  }
+}
+
+void run_external(std::vector<std::string> args, const RedirectInfo& redirect, bool background,
+                  const std::string& original_command) {
   const std::string& program = args[0];
   const std::string path = find_in_path(program);
   if (path.empty()) {
@@ -365,8 +494,14 @@ void run_external(std::vector<std::string> args, const RedirectInfo& redirect) {
   }
 
   if (pid > 0) {
-    int status = 0;
-    waitpid(pid, &status, 0);
+    if (background) {
+      const int job_number = next_job_number();
+      bg_jobs().push_back({job_number, pid, original_command});
+      std::cout << '[' << job_number << "] " << pid << '\n';
+    } else {
+      int status = 0;
+      waitpid(pid, &status, 0);
+    }
   }
 }
 
@@ -374,23 +509,43 @@ int main() {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
 
+  struct sigaction sa {};
+  sa.sa_handler = sigchld_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+  sigaction(SIGCHLD, &sa, nullptr);
+
   rl_attempted_completion_function = command_completion;
   rl_completion_append_character = ' ';
 
   while (true) {
+    reap_jobs();
+
     char* raw_line = readline("$ ");
     if (raw_line == nullptr) {
       break;
     }
 
-    std::string input(raw_line);
+    const std::string input(raw_line);
     free(raw_line);
 
     if (input.empty()) {
       continue;
     }
 
+    bool background = false;
+    if (!input.empty() && input.back() == '&') {
+      background = true;
+    }
+
     std::vector<std::string> args = parse_args(input);
+    if (args.empty()) {
+      continue;
+    }
+
+    if (background && !args.empty() && args.back() == "&") {
+      args.pop_back();
+    }
     if (args.empty()) {
       continue;
     }
@@ -416,8 +571,10 @@ int main() {
       run_pwd();
     } else if (cmd == "cd") {
       run_cd(args);
+    } else if (cmd == "jobs") {
+      run_jobs();
     } else {
-      run_external(args, redirect);
+      run_external(args, redirect, background, input);
     }
   }
 
