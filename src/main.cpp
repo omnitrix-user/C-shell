@@ -1,5 +1,6 @@
 #include <cctype>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -10,6 +11,113 @@
 #include <unistd.h>
 
 namespace fs = std::filesystem;
+
+struct RedirectInfo {
+  std::string stdout_file;
+  bool stdout_append = false;
+  std::string stderr_file;
+  bool stderr_append = false;
+};
+
+RedirectInfo extract_redirects(std::vector<std::string>& args) {
+  RedirectInfo redirect;
+  for (size_t i = 0; i < args.size();) {
+    const std::string& arg = args[i];
+    if ((arg == ">" || arg == "1>") && i + 1 < args.size()) {
+      redirect.stdout_file = args[i + 1];
+      redirect.stdout_append = false;
+      args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                 args.begin() + static_cast<std::ptrdiff_t>(i + 2));
+      continue;
+    }
+    if ((arg == ">>" || arg == "1>>") && i + 1 < args.size()) {
+      redirect.stdout_file = args[i + 1];
+      redirect.stdout_append = true;
+      args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                 args.begin() + static_cast<std::ptrdiff_t>(i + 2));
+      continue;
+    }
+    if (arg == "2>" && i + 1 < args.size()) {
+      redirect.stderr_file = args[i + 1];
+      redirect.stderr_append = false;
+      args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                 args.begin() + static_cast<std::ptrdiff_t>(i + 2));
+      continue;
+    }
+    if (arg == "2>>" && i + 1 < args.size()) {
+      redirect.stderr_file = args[i + 1];
+      redirect.stderr_append = true;
+      args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                 args.begin() + static_cast<std::ptrdiff_t>(i + 2));
+      continue;
+    }
+    ++i;
+  }
+  return redirect;
+}
+
+bool apply_redirects(const RedirectInfo& redirect) {
+  if (!redirect.stdout_file.empty()) {
+    const int flags = O_WRONLY | O_CREAT | (redirect.stdout_append ? O_APPEND : O_TRUNC);
+    const int fd = open(redirect.stdout_file.c_str(), flags, 0644);
+    if (fd < 0) {
+      return false;
+    }
+    dup2(fd, STDOUT_FILENO);
+    close(fd);
+  }
+
+  if (!redirect.stderr_file.empty()) {
+    const int flags = O_WRONLY | O_CREAT | (redirect.stderr_append ? O_APPEND : O_TRUNC);
+    const int fd = open(redirect.stderr_file.c_str(), flags, 0644);
+    if (fd < 0) {
+      return false;
+    }
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+  }
+
+  return true;
+}
+
+class RedirectScope {
+ public:
+  explicit RedirectScope(const RedirectInfo& redirect) {
+    if (!redirect.stdout_file.empty()) {
+      saved_stdout_ = dup(STDOUT_FILENO);
+      const int flags = O_WRONLY | O_CREAT | (redirect.stdout_append ? O_APPEND : O_TRUNC);
+      const int fd = open(redirect.stdout_file.c_str(), flags, 0644);
+      if (fd >= 0) {
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+      }
+    }
+    if (!redirect.stderr_file.empty()) {
+      saved_stderr_ = dup(STDERR_FILENO);
+      const int flags = O_WRONLY | O_CREAT | (redirect.stderr_append ? O_APPEND : O_TRUNC);
+      const int fd = open(redirect.stderr_file.c_str(), flags, 0644);
+      if (fd >= 0) {
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+      }
+    }
+  }
+
+  ~RedirectScope() {
+    if (saved_stdout_ >= 0) {
+      dup2(saved_stdout_, STDOUT_FILENO);
+      close(saved_stdout_);
+    }
+    if (saved_stderr_ >= 0) {
+      dup2(saved_stderr_, STDERR_FILENO);
+      close(saved_stderr_);
+    }
+  }
+
+ private:
+  int saved_stdout_ = -1;
+  int saved_stderr_ = -1;
+};
 
 std::vector<std::string> parse_args(const std::string& input) {
   std::vector<std::string> args;
@@ -145,7 +253,7 @@ void run_cd(const std::vector<std::string>& args) {
   }
 }
 
-void run_external(const std::vector<std::string>& args) {
+void run_external(std::vector<std::string> args, const RedirectInfo& redirect) {
   const std::string& program = args[0];
   const std::string path = find_in_path(program);
   if (path.empty()) {
@@ -155,6 +263,8 @@ void run_external(const std::vector<std::string>& args) {
 
   const pid_t pid = fork();
   if (pid == 0) {
+    apply_redirects(redirect);
+
     std::vector<std::string> arg_storage = args;
     std::vector<char*> argv;
     argv.reserve(arg_storage.size() + 1);
@@ -184,7 +294,12 @@ int main() {
       break;
     }
 
-    const std::vector<std::string> args = parse_args(input);
+    std::vector<std::string> args = parse_args(input);
+    if (args.empty()) {
+      continue;
+    }
+
+    const RedirectInfo redirect = extract_redirects(args);
     if (args.empty()) {
       continue;
     }
@@ -195,15 +310,18 @@ int main() {
       return 0;
     }
     if (cmd == "echo") {
+      RedirectScope redirect_scope(redirect);
       run_echo(args);
     } else if (cmd == "type") {
+      RedirectScope redirect_scope(redirect);
       run_type(args);
     } else if (cmd == "pwd") {
+      RedirectScope redirect_scope(redirect);
       run_pwd();
     } else if (cmd == "cd") {
       run_cd(args);
     } else {
-      run_external(args);
+      run_external(args, redirect);
     }
   }
 
